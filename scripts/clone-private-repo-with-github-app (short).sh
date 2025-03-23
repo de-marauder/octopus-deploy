@@ -61,4 +61,4 @@ ACCESS_TOKEN=$(curl -sS -X POST \
     jq -r '.token')
 
 # Clone repository
-git clone "https://x-access-token:$ACCESS_TOKEN@github.com/$GITHUB_ORG/$GITHUB_REPO.git"
+git clone "https://x-access-token:$ACCESS_TOKEN@github.com/$GITHUB_ORG/$GITHUB_REPO.git" -q
