@@ -1,55 +1,64 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-GITHUB_APP_ID=1188563
-GITHUB_ORG=de-marauder
-GITHUB_REPO=test-repo
-REGION=us-east-1
+# Constants
+readonly GITHUB_APP_ID="${GITHUB_APP_ID:-1188563}"
+readonly GITHUB_ORG="${GITHUB_ORG:-de-marauder}"
+readonly GITHUB_REPO="${GITHUB_REPO:-test-repo}"
+readonly SECRET_NAME="github-app-private-key"
+readonly TEMP_KEY_PATH="/tmp/github-app-${RANDOM}.pem"
 
-# 1. Fetch GitHub App private key from AWS Secrets Manager
-PRIVATE_KEY=$(aws secretsmanager get-secret-value \
-  --secret-id github-app-private-key \
-  --region $REGION \
-  --query SecretString \
-  --output text)
+cleanup() {
+    # Securely remove the private key file
+    if [[ -f "$TEMP_KEY_PATH" ]]; then
+        shred -u "$TEMP_KEY_PATH"
+    fi
+}
 
-# 2. Save private key locally temporarily
-echo '$PRIVATE_KEY > /tmp/github-app.pem'
+trap cleanup EXIT
 
-# 3. Generate JWT
+# Get private key from Secrets Manager
+aws secretsmanager get-secret-value \
+    --secret-id "$SECRET_NAME" \
+    --query SecretString \
+    --output text > "$TEMP_KEY_PATH"
+
+chmod 600 "$TEMP_KEY_PATH"
+
+# Generate JWT
 NOW=$(date +%s)
-EXP=$((NOW + 540)) # 9 minutes from now
+EXP=$((NOW + 540))
 
 JWT=$(jq -n --arg now "$NOW" --arg exp "$EXP" --arg iss "$GITHUB_APP_ID" \
-  '{
-    alg: "RS256",
-    typ: "JWT"
-  }' | openssl enc -base64 -A | tr -d '=' | tr '/+' '_-' ).$(jq -n --arg now "$NOW" --arg exp "$EXP" --arg iss "$GITHUB_APP_ID" \
-  '{
-    iat: ($now | tonumber),
-    exp: ($exp | tonumber),
-    iss: ($iss | tonumber)
-  }' | openssl enc -base64 -A | tr -d '=' | tr '/+' '_-' )
+    '{
+        alg: "RS256",
+        typ: "JWT"
+    }' | openssl enc -base64 -A | tr -d '=' | tr '/+' '_-' ).$(jq -n --arg now "$NOW" --arg exp "$EXP" --arg iss "$GITHUB_APP_ID" \
+    '{
+        iat: ($now | tonumber),
+        exp: ($exp | tonumber),
+        iss: ($iss | tonumber)
+    }' | openssl enc -base64 -A | tr -d '=' | tr '/+' '_-' )
 
 SIGNATURE=$(echo -n "$JWT" | \
-  openssl dgst -sha256 -sign /tmp/github-app.pem | \
-  openssl enc -base64 -A | tr -d '=' | tr '/+' '_-')
+    openssl dgst -sha256 -sign "$TEMP_KEY_PATH" | \
+    openssl enc -base64 -A | tr -d '=' | tr '/+' '_-')
 
 JWT="$JWT.$SIGNATURE"
 
-# 4. Get installation ID
-INSTALLATION_ID=$(curl -s -H "Authorization: Bearer $JWT" -H "Accept: application/vnd.github+json" \
-  https://api.github.com/app/installations | jq -r ".[] | select(.account.login==\"$GITHUB_ORG\") | .id")
+# Get installation ID
+INSTALLATION_ID=$(curl -sS -H "Authorization: Bearer $JWT" \
+    -H "Accept: application/vnd.github+json" \
+    https://api.github.com/app/installations | \
+    jq -r ".[] | select(.account.login==\"$GITHUB_ORG\") | .id")
 
-# 5. Get Installation Access Token
-ACCESS_TOKEN=$(curl -s -X POST \
-  -H "Authorization: Bearer $JWT" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens | jq -r '.token')
+# Get installation token
+ACCESS_TOKEN=$(curl -sS -X POST \
+    -H "Authorization: Bearer $JWT" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" | \
+    jq -r '.token')
 
-# 6. Git clone with token
-git clone https://x-access-token:$ACCESS_TOKEN@github.com/$GITHUB_ORG/$GITHUB_REPO.git
-
-# 7. Cleanup
-rm /tmp/github-app.pem
+# Clone repository
+git clone "https://x-access-token:$ACCESS_TOKEN@github.com/$GITHUB_ORG/$GITHUB_REPO.git"
